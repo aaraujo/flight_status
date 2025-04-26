@@ -1,0 +1,23 @@
+[package]
+name = "flight_agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+chrono = { version = "0.4.40", features = ["serde"] }
+dotenv = "0.15.0"
+opentelemetry = { version = "0.29.1", features = ["trace", "metrics", "logs"] }
+opentelemetry-appender-tracing = "0.29.1"
+opentelemetry-otlp = { version = "0.29.0", features = ["grpc-tonic", "tokio", "trace", "metrics", "logs"] }
+opentelemetry-stdout = "0.29.0"
+opentelemetry_sdk = { version = "0.29.0", features = ["experimental_async_runtime", "rt-tokio"] }
+reqwest = { version = "0.12.15", features = ["json", "rustls-tls"] }
+rig-core = "0.11.1"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+tokio = { version = "1.44.2", features = ["full"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-opentelemetry = "0.30.0"
