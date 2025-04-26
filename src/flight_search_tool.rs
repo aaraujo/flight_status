@@ -10,7 +10,7 @@ use std::env;
 use tracing::{debug, error, info, instrument};
 
 /// API parameters provided by model
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct FlightSearchArgs {
     source: String,
     destination: String,
@@ -335,5 +335,72 @@ impl Tool for FlightSearchTool {
         // Return the formatted flight options
         inc_flight_status_success();
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+
+    fn cleanup_test_env() {
+        unsafe { env::remove_var("RAPIDAPI_KEY") };
+    }
+
+    #[test]
+    fn test_flight_search_args_validation() {
+        let tool = FlightSearchTool;
+
+        // Test with empty source
+        let args = FlightSearchArgs {
+            source: "".to_string(),
+            destination: "DEL".to_string(),
+            ..Default::default()
+        };
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.call(args));
+        assert!(result.is_err());
+
+        // Test with empty destination
+        let args = FlightSearchArgs {
+            source: "BOM".to_string(),
+            destination: "".to_string(),
+            ..Default::default()
+        };
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.call(args));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_flight_search_tool_definition() {
+        let tool = FlightSearchTool;
+        let definition = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.definition("test".to_string()));
+
+        assert_eq!(definition.name, "search_flights");
+        assert!(definition.description.contains("Search for flights"));
+        assert!(definition.parameters.to_string().contains("source"));
+        assert!(definition.parameters.to_string().contains("destination"));
+    }
+
+    #[test]
+    fn test_missing_api_key_error() {
+        cleanup_test_env(); // Ensure no API key is set
+        let tool = FlightSearchTool;
+        let args = FlightSearchArgs {
+            source: "BOM".to_string(),
+            destination: "DEL".to_string(),
+            ..Default::default()
+        };
+
+        let result = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(tool.call(args));
+
+        assert!(result.is_err());
     }
 }

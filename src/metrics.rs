@@ -43,3 +43,36 @@ fn flight_status_error() -> &'static Counter<u64> {
             .build()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flight_status_success_once_lock() {
+        // Test that flight_status_success() returns the same instance across multiple calls
+        let counter1 = flight_status_success();
+        let counter2 = flight_status_success();
+        assert!(std::ptr::eq(counter1, counter2));
+    }
+
+    #[test]
+    fn test_flight_status_error_once_lock() {
+        // Test that flight_status_error() returns the same instance across multiple calls
+        let counter1 = flight_status_error();
+        let counter2 = flight_status_error();
+        assert!(std::ptr::eq(counter1, counter2));
+    }
+
+    #[test]
+    fn test_metrics_increment() {
+        // Test that metrics can be incremented
+        // Note: This test doesn't verify the actual metric values
+        // as that would require a running OpenTelemetry collector
+        inc_flight_status_success();
+        inc_flight_status_error(
+            404,
+            &FlightSearchError::HttpRequestFailed("test".to_string()),
+        );
+    }
+}

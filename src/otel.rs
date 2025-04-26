@@ -225,3 +225,24 @@ fn init_logs() -> Result<SdkLoggerProvider, anyhow::Error> {
         .build();
     Ok(provider)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_service_once_lock() {
+        // Test that get_service() returns the same instance across multiple calls
+        let service1 = get_service();
+        let service2 = get_service();
+        assert!(std::ptr::eq(service1, service2));
+    }
+
+    #[test]
+    fn test_get_meter_once_lock() {
+        // Test that get_meter() returns the same instance across multiple calls
+        let meter1 = get_meter();
+        let meter2 = get_meter();
+        assert!(std::ptr::eq(meter1, meter2));
+    }
+}
