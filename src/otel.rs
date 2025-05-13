@@ -67,13 +67,13 @@ impl OtelProviders {
         let log_layer = otel_layer.with_filter(filter_otel);
         let fmt_layer = tracing_subscriber::fmt::layer()
             .with_thread_names(true)
-            .with_filter(EnvFilter::new("info").add_directive("opentelemetry=debug".parse()?));
+            .with_filter(EnvFilter::new("info").add_directive("opentelemetry=info".parse()?));
 
         let trace_provider = init_traces()?;
         // Create a new OpenTelemetryTracingBridge using the TracerProvider.
         let tracing_layer = OpenTelemetryLayer::new(trace_provider.tracer(get_service().as_str()));
         let tracing_layer = tracing_layer
-            .with_filter(EnvFilter::new("info").add_directive("opentelemetry=debug".parse()?));
+            .with_filter(EnvFilter::new("info").add_directive("opentelemetry=info".parse()?));
 
         let subscriber = tracing_subscriber::registry()
             .with(log_layer)

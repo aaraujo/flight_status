@@ -1,28 +1,27 @@
 use crate::error::FlightSearchError;
 use crate::metrics::{inc_flight_status_error, inc_flight_status_success};
-use chrono::{Duration, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
 use tracing::{debug, error, info, instrument};
+
+const DATE_FORMAT: &str = "%Y-%m-%d";
 
 /// API parameters provided by model
 #[derive(Debug, Deserialize, Default)]
 pub struct FlightSearchArgs {
     source: String,
     destination: String,
-    date: Option<String>,
-    sort: Option<String>,
+    departure_date: Option<String>,
+    return_date: Option<String>,
     service: Option<String>,
-    itinerary_type: Option<String>,
     adults: Option<u8>,
-    seniors: Option<u8>,
     currency: Option<String>,
-    nearby: Option<String>,
-    nonstop: Option<String>,
 }
 
 /// Structured response provided to model
@@ -35,7 +34,12 @@ pub struct FlightOption {
     pub stops: usize,
     pub price: f64,
     pub currency: String,
-    pub booking_url: String,
+}
+
+#[derive(Debug, Serialize, Default)]
+struct SkyscannerLocation {
+    sky_id: String,
+    entity_id: String,
 }
 
 #[derive(Debug)]
@@ -54,17 +58,13 @@ impl Tool for FlightSearchTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "source": { "type": "string", "description": "Source airport code (e.g., 'BOM')" },
-                    "destination": { "type": "string", "description": "Destination airport code (e.g., 'DEL')" },
-                    "date": { "type": "string", "description": "Flight date in 'YYYY-MM-DD' format" },
-                    "sort": { "type": "string", "description": "Sort order for results", "enum": ["ML_BEST_VALUE", "PRICE", "DURATION", "EARLIEST_OUTBOUND_DEPARTURE", "EARLIEST_OUTBOUND_ARRIVAL", "LATEST_OUTBOUND_DEPARTURE", "LATEST_OUTBOUND_ARRIVAL"] },
-                    "service": { "type": "string", "description": "Class of service", "enum": ["ECONOMY", "PREMIUM_ECONOMY", "BUSINESS", "FIRST"] },
-                    "itinerary_type": { "type": "string", "description": "Itinerary type", "enum": ["ONE_WAY", "ROUND_TRIP"] },
-                    "adults": { "type": "integer", "description": "Number of adults" },
-                    "seniors": { "type": "integer", "description": "Number of seniors" },
-                    "currency": { "type": "string", "description": "Currency code (e.g., 'USD')" },
-                    "nearby": { "type": "string", "description": "Include nearby airports", "enum": ["yes", "no"] },
-                    "nonstop": { "type": "string", "description": "Show only nonstop flights", "enum": ["yes", "no"] },
+                    "source": { "type": "string", "description": "Source airport code or city name (e.g., 'BOM' or 'Mumbai')" },
+                    "destination": { "type": "string", "description": "Destination airport code or city name (e.g., 'DEL' or 'Delhi')" },
+                    "departure_date": { "type": "string", "description": "Departure flight date in 'YYYY-MM-DD' format" },
+                    "return_date": { "type": "string", "description": "Return flight date in 'YYYY-MM-DD' format" },
+                    "service": { "type": "string", "description": "Class of service", "enum": ["economy", "premium_economy", "business"] },
+                    "adults": { "type": "integer", "description": "Number of adults (over 12 years old)" },
+                    "currency": { "type": "string", "description": "Currency code (e.g., 'USD')" }
                 },
                 "required": ["source", "destination"]
             }),
@@ -75,47 +75,55 @@ impl Tool for FlightSearchTool {
     async fn call(&self, args: FlightSearchArgs) -> Result<String, FlightSearchError> {
         // Use the RapidAPI key from an environment variable
         let api_key = env::var("RAPIDAPI_KEY").map_err(|_| FlightSearchError::MissingApiKey)?;
-
         // Set default values if not provided
-        let date = args.date.unwrap_or_else(|| {
+        let departure_date = args.departure_date.unwrap_or_else(|| {
             let date = Utc::now() + Duration::days(30);
-            date.format("%Y-%m-%d").to_string()
+            date.format(DATE_FORMAT).to_string()
         });
-
-        let sort = args.sort.unwrap_or_else(|| "ML_BEST_VALUE".to_string());
-        let service = args.service.unwrap_or_else(|| "ECONOMY".to_string());
-        let itinerary_type = args.itinerary_type.unwrap_or_else(|| "ONE_WAY".to_string());
+        let service = args.service.unwrap_or_else(|| "economy".to_string());
         let adults = args.adults.unwrap_or(1);
-        let seniors = args.seniors.unwrap_or(0);
+        let children = 0; // Not in args yet
+        let infants = 0; // Not in args yet
         let currency = args.currency.unwrap_or_else(|| "USD".to_string());
-        let nearby = args.nearby.unwrap_or_else(|| "no".to_string());
-        let nonstop = args.nonstop.unwrap_or_else(|| "no".to_string());
-
-        // Build URL query parameters
+        let market = "US".to_string();
+        // For roundtrip, use 7 days after departure date if only one date is provided
+        let in_date = departure_date.clone();
+        let return_date = args.return_date.unwrap_or_else(|| {
+            let dep_date = NaiveDate::parse_from_str(departure_date.as_str(), DATE_FORMAT)
+                .expect("Unable to parse departure_date");
+            let return_date = dep_date + Duration::days(7);
+            return_date.format(DATE_FORMAT).to_string()
+        });
+        let out_date = return_date.clone();
+        // Resolve source and destination to skyId/entityId
+        let source_loc = resolve_skyscanner_location(&api_key, &args.source).await?;
+        let dest_loc = resolve_skyscanner_location(&api_key, &args.destination).await?;
+        // Build Skyscanner query params
         let mut query_params = HashMap::new();
-        query_params.insert("date", date); // valid?
-        query_params.insert("sourceAirportCode", args.source);
-        query_params.insert("destinationAirportCode", args.destination);
-        query_params.insert("itineraryType", itinerary_type);
-        query_params.insert("sortOrder", sort);
-        query_params.insert("numAdults", adults.to_string());
-        query_params.insert("numSeniors", seniors.to_string());
-        query_params.insert("classOfService", service);
-        query_params.insert("pageNumber", "1".to_string());
-        query_params.insert("nearby", nearby);
-        query_params.insert("nonstop", nonstop);
-        query_params.insert("currencyCode", currency.clone());
-
-        info!("Calling flight search API with: {:?}", query_params);
-
+        query_params.insert("inDate", in_date.clone());
+        query_params.insert("outDate", out_date.clone());
+        query_params.insert("origin", source_loc.sky_id.clone());
+        query_params.insert("originId", source_loc.entity_id.clone());
+        query_params.insert("destination", dest_loc.sky_id.clone());
+        query_params.insert("destinationId", dest_loc.entity_id.clone());
+        query_params.insert("cabinClass", service.clone());
+        query_params.insert("adults", adults.to_string());
+        query_params.insert("children", children.to_string());
+        query_params.insert("infants", infants.to_string());
+        query_params.insert("market", market.clone());
+        query_params.insert("currency", currency.clone());
+        info!(
+            "Calling Skyscanner flights/roundtrip/list API with: {:?}",
+            query_params
+        );
         let client = reqwest::Client::new();
         let response = client
-            .get("https://tripadvisor16.p.rapidapi.com/api/v1/flights/searchFlights")
+            .get("https://skyscanner89.p.rapidapi.com/flights/roundtrip/list")
             .headers({
                 let mut headers = reqwest::header::HeaderMap::new();
                 headers.insert(
                     "X-RapidAPI-Host",
-                    "tripadvisor16.p.rapidapi.com".parse().unwrap(),
+                    "skyscanner89.p.rapidapi.com".parse().unwrap(),
                 );
                 headers.insert("X-RapidAPI-Key", api_key.parse().unwrap());
                 headers
@@ -124,190 +132,149 @@ impl Tool for FlightSearchTool {
             .send()
             .await
             .map_err(|e| FlightSearchError::HttpRequestFailed(e.to_string()))?;
-
-        // Get the status code before consuming `response`
         let status = response.status();
-
-        // Read the response text (this consumes `response`)
         let text = response
             .text()
             .await
             .map_err(|e| FlightSearchError::HttpRequestFailed(e.to_string()))?;
-
-        // Log the raw API response for debugging
-        debug!("Raw API response:\n{}", text);
-
-        // Check if the response is an error
         if !status.is_success() {
-            error!("API call failed with status {}: response: {}", status, text);
+            error!(
+                "Skyscanner API call failed with status {}: response: {}",
+                status, text
+            );
             let error =
                 FlightSearchError::ApiError(format!("Status: {}, Response: {}", status, text));
             inc_flight_status_error(status.as_u16() as u64, &error);
             return Err(error);
         }
-
-        // Parse the response JSON
+        // Parse Skyscanner response and map to FlightOption(s)
         let data: Value = serde_json::from_str(&text)
             .map_err(|e| FlightSearchError::HttpRequestFailed(e.to_string()))?;
-        debug!("Received response: {:?}", data);
-
-        // Check for API errors in the JSON response
-        if let Some(error) = data.get("error") {
-            let error_message = error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("Unknown error");
-            error!("API response contained an error: {}", error_message);
-            let error = FlightSearchError::ApiError(error_message.to_string());
-            inc_flight_status_error(status.as_u16() as u64, &error);
-            return Err(error);
-        }
-
-        let empty_leg = json!({});
-
-        // Extract flight options
+        debug!("Parsed Skyscanner response: {:?}", data);
         let mut flight_options = Vec::new();
-
-        // Check if 'data' contains 'flights' array
-        if let Some(flights) = data
-            .get("data")
-            .and_then(|d| d.get("flights"))
-            .and_then(|f| f.as_array())
-        {
-            // Iterate over flight entries, taking the first 5
-            for flight in flights.iter().take(5) {
-                // Extract flight segments
-                if let Some(segments) = flight
-                    .get("segments")
-                    .and_then(|s| s.as_array())
-                    .and_then(|s| s.first())
-                {
-                    // Extract legs from the first segment
-                    if let Some(legs) = segments.get("legs").and_then(|l| l.as_array()) {
-                        let first_leg = legs.first().unwrap_or(&empty_leg);
-                        let last_leg = legs.last().unwrap_or(&empty_leg);
-
-                        // Extract airline name
-                        let airline = first_leg
-                            .get("marketingCarrier")
-                            .and_then(|mc| mc.get("displayName"))
-                            .and_then(|dn| dn.as_str())
-                            .unwrap_or("Unknown")
-                            .to_string();
-
-                        // Extract flight number
-                        let flight_number = format!(
-                            "{}{}",
-                            first_leg
-                                .get("marketingCarrierCode")
-                                .and_then(|c| c.as_str())
-                                .unwrap_or(""),
-                            first_leg
-                                .get("flightNumber")
+        // Support both wrapped and unwrapped responses
+        let itineraries = data
+            .get("itineraries")
+            .or_else(|| data.get("data").and_then(|d| d.get("itineraries")));
+        if let Some(itineraries) = itineraries {
+            if let Some(buckets) = itineraries.get("buckets").and_then(|b| b.as_array()) {
+                'outer: for bucket in buckets {
+                    if let Some(items) = bucket.get("items").and_then(|i| i.as_array()) {
+                        for item in items {
+                            // Extract airline name (first marketing carrier of first leg)
+                            let airline = item
+                                .get("legs")
+                                .and_then(|legs| legs.as_array())
+                                .and_then(|legs| legs.first())
+                                .and_then(|leg| leg.get("carriers"))
+                                .and_then(|carriers| carriers.get("marketing"))
+                                .and_then(|marketing| marketing.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|carrier| carrier.get("name"))
                                 .and_then(|n| n.as_str())
-                                .unwrap_or("")
-                        );
-
-                        // Extract departure and arrival times
-                        let departure = first_leg
-                            .get("departureDateTime")
-                            .and_then(|dt| dt.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        let arrival = last_leg
-                            .get("arrivalDateTime")
-                            .and_then(|dt| dt.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        // Parse departure time or fallback to current UTC time
-                        let departure_time = chrono::DateTime::parse_from_rfc3339(&departure)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| chrono::Utc::now());
-
-                        // Parse arrival time or fallback to current UTC time
-                        let arrival_time = chrono::DateTime::parse_from_rfc3339(&arrival)
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(|_| chrono::Utc::now());
-
-                        // Calculate flight duration
-                        let duration = arrival_time - departure_time;
-                        let hours = duration.num_hours();
-                        let minutes = duration.num_minutes() % 60;
-                        let duration_str = format!("{} hours {} minutes", hours, minutes);
-
-                        // Determine number of stops
-                        let stops = if legs.len() > 1 { legs.len() - 1 } else { 0 };
-
-                        // Extract purchase links array for price information
-                        let purchase_links = flight
-                            .get("purchaseLinks")
-                            .and_then(|pl| pl.as_array())
-                            .map(|v| v.as_slice())
-                            .unwrap_or(&[]);
-
-                        // Find the best price from purchase links
-                        let best_price = purchase_links.iter().min_by_key(|p| {
-                            p.get("totalPrice")
-                                .and_then(|tp| tp.as_f64())
-                                .unwrap_or(f64::MAX) as u64
-                        });
-
-                        // Extract pricing and booking URL if available
-                        if let Some(best_price) = best_price {
-                            let total_price = best_price
-                                .get("totalPrice")
-                                .and_then(|tp| tp.as_f64())
-                                .unwrap_or(0.0);
-                            let booking_url = best_price
-                                .get("url")
-                                .and_then(|u| u.as_str())
+                                .unwrap_or("Unknown Airline")
+                                .to_string();
+                            let flight_number = item
+                                .get("legs")
+                                .and_then(|legs| legs.as_array())
+                                .and_then(|legs| legs.first())
+                                .and_then(|leg| leg.get("segments"))
+                                .and_then(|segments| segments.as_array())
+                                .and_then(|segment| segment.first())
+                                .and_then(|leg| leg.get("flightNumber"))
+                                .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-
-                            // Skip flights with price 0.0
-                            if total_price == 0.0 {
-                                continue;
+                            // Departure and arrival from first leg
+                            let departure = item
+                                .get("legs")
+                                .and_then(|legs| legs.as_array())
+                                .and_then(|legs| legs.first())
+                                .and_then(|leg| leg.get("departure"))
+                                .and_then(|d| d.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let arrival = item
+                                .get("legs")
+                                .and_then(|legs| legs.as_array())
+                                .and_then(|legs| legs.first())
+                                .and_then(|leg| leg.get("arrival"))
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            // Duration from first leg
+                            let duration = item
+                                .get("legs")
+                                .and_then(|legs| legs.as_array())
+                                .and_then(|legs| legs.first())
+                                .and_then(|leg| leg.get("durationInMinutes"))
+                                .and_then(|d| d.as_u64())
+                                .map(|mins| format!("{} hours {} minutes", mins / 60, mins % 60))
+                                .unwrap_or_else(|| "Unknown duration".to_string());
+                            // Stops from first leg
+                            let stops = item
+                                .get("legs")
+                                .and_then(|legs| legs.as_array())
+                                .and_then(|legs| legs.first())
+                                .and_then(|leg| leg.get("stopCount"))
+                                .and_then(|s| s.as_u64())
+                                .unwrap_or(0) as usize;
+                            // Price: use pricingOptions[0].price.amount or price.raw
+                            let price = item
+                                .get("pricingOptions")
+                                .and_then(|po| po.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|opt| opt.get("price"))
+                                .and_then(|p| p.get("amount"))
+                                .and_then(|a| a.as_f64())
+                                .or_else(|| {
+                                    item.get("price")
+                                        .and_then(|p| p.get("raw"))
+                                        .and_then(|a| a.as_f64())
+                                })
+                                .unwrap_or(0.0);
+                            // Currency: use pricingOptions[0].price.currencyCode or fallback to USD
+                            let currency = item
+                                .get("pricingOptions")
+                                .and_then(|po| po.as_array())
+                                .and_then(|arr| arr.first())
+                                .and_then(|opt| opt.get("price"))
+                                .and_then(|p| p.get("currencyCode"))
+                                .and_then(|c| c.as_str())
+                                .or_else(|| {
+                                    item.get("price")
+                                        .and_then(|p| p.get("currency"))
+                                        .and_then(|c| c.as_str())
+                                })
+                                .unwrap_or(&currency)
+                                .to_string();
+                            // Only push if price is nonzero
+                            if price > 0.0 {
+                                flight_options.push(FlightOption {
+                                    airline,
+                                    flight_number,
+                                    departure,
+                                    arrival,
+                                    duration,
+                                    stops,
+                                    price,
+                                    currency,
+                                });
                             }
-
-                            // Append extracted flight options to flight_options vector
-                            flight_options.push(FlightOption {
-                                airline,
-                                flight_number,
-                                departure,
-                                arrival,
-                                duration: duration_str,
-                                stops,
-                                price: total_price,
-                                currency: currency.clone(),
-                                booking_url,
-                            });
+                            if flight_options.len() >= 5 {
+                                break 'outer;
+                            }
                         }
                     }
                 }
             }
-        } else {
-            // Return an error if response structure is invalid
-            error!("Invalid response structure: {:?}", data);
-            let error_message =
-                format!("Status: {}, Response: {:?}, Data: {:?}", status, text, data);
-            let error = FlightSearchError::InvalidResponse(error_message.to_string());
-            inc_flight_status_error(status.as_u16() as u64, &error);
-            return Err(error);
         }
-
-        // Format flight_options into a readable string
-        // Check if there are any flight options
         if flight_options.is_empty() {
             return Ok("No flights found for the given criteria.".to_string());
         }
-
-        // Initialize the output string
+        // Generate response for LLM
         let mut output = String::new();
         output.push_str("Here are some flight options:\n\n");
-
-        // Iterate over each flight option and format the details
         for (i, option) in flight_options.iter().enumerate() {
             output.push_str(&format!("{}. **Airline**: {}\n", i + 1, option.airline));
             output.push_str(&format!(
@@ -329,13 +296,67 @@ impl Tool for FlightSearchTool {
                 "   - **Price**: {:.2} {}\n",
                 option.price, option.currency
             ));
-            output.push_str(&format!("   - **Booking URL**: {}\n\n", option.booking_url));
         }
-
-        // Return the formatted flight options
         inc_flight_status_success();
         Ok(output)
     }
+}
+
+#[instrument(name = "resolve_skyscanner_location")]
+async fn resolve_skyscanner_location(
+    api_key: &str,
+    query: &str,
+) -> Result<SkyscannerLocation, FlightSearchError> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("https://skyscanner89.p.rapidapi.com/flights/auto-complete")
+        .headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                "X-RapidAPI-Host",
+                "skyscanner89.p.rapidapi.com".parse().unwrap(),
+            );
+            headers.insert("X-RapidAPI-Key", api_key.parse().unwrap());
+            headers
+        })
+        .query(&[("query", query)])
+        .send()
+        .await
+        .map_err(|e| FlightSearchError::HttpRequestFailed(e.to_string()))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|e| FlightSearchError::HttpRequestFailed(e.to_string()))?;
+    if !status.is_success() {
+        return Err(FlightSearchError::ApiError(format!(
+            "Auto-complete failed: {}: {}",
+            status, text
+        )));
+    }
+    let data: Value = serde_json::from_str(&text)
+        .map_err(|e| FlightSearchError::HttpRequestFailed(e.to_string()))?;
+    // Use inputSuggest array per schema
+    if let Some(suggestions) = data.get("inputSuggest").and_then(|d| d.as_array()) {
+        for item in suggestions {
+            if let Some(nav) = item.get("navigation") {
+                if let Some(params) = nav.get("relevantFlightParams") {
+                    if let (Some(sky_id), Some(entity_id)) = (
+                        params.get("skyId").and_then(|v| v.as_str()),
+                        params.get("entityId").and_then(|v| v.as_str()),
+                    ) {
+                        return Ok(SkyscannerLocation {
+                            sky_id: sky_id.to_string(),
+                            entity_id: entity_id.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Err(FlightSearchError::InvalidResponse(
+        "No valid airport found in auto-complete response".to_string(),
+    ))
 }
 
 #[cfg(test)]
